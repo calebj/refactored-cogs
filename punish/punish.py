@@ -14,7 +14,7 @@ UserInputError = commands.UserInputError
 log = logging.getLogger('red.punish')
 
 TIMESPEC_TRANSLATE = {'s': 1, 'm': 60, 'h': 60 * 60, 'd': 60 * 60 * 24}
-
+DEFAULT_TIMEOUT = '30m'
 
 def _parse_time(time):
     if any(u in time for u in TIMESPEC_TRANSLATE.keys()):
@@ -57,21 +57,19 @@ class Punish:
 
     @commands.command(pass_context=True, no_pm=True)
     @checks.mod_or_permissions(manage_messages=True)
-    async def punish(self, ctx, user: discord.Member, duration: str, *, reason: str=None):
+    async def punish(self, ctx, user: discord.Member, duration: str=None, *, reason: str=None):
         """Puts a user into timeout for a specified time period, with an optional reason.
         Time specification is any combination of number with the units s,m,h,d.
         Example: !punish @idiot 1.1h10m Enough bitching already!"""
 
         server = ctx.message.server
-        duration = _parse_time(duration)
-        timestamp = time.time() + duration
 
         # --- CREATING ROLE ---
         server = user.server
         role = discord.utils.get(user.server.roles, name=self.role_name)
         if not role:
-            if not any(r.permissions.manage_roles for r in server.me.roles) and\
-                    any(r.permissions.manage_channels for r in server.me.roles):
+            if not (any(r.permissions.manage_roles for r in server.me.roles) and\
+                    any(r.permissions.manage_channels for r in server.me.roles)):
                 await self.bot.say("The Manage Roles and Manage Channels permissions are required to use this command.")
                 return
             else:
@@ -90,11 +88,17 @@ class Punish:
             self.json[server.id] = {}
 
         if user.id in self.json[server.id]:
-            await self.bot.say('User was already punished; resetting their timer...')
+            msg = 'User was already punished; resetting their timer...'
         elif role in user.roles:
-            await self.bot.say('User was punished but had no timer, adding it now...')
+            msg = 'User was punished but had no timer, adding it now...'
         else:
-            await self.bot.say('Done.')
+            msg = 'Done.'
+
+        if not duration:
+            duration = DEFAULT_TIMEOUT
+            msg += ' Using default duration of ' + duration
+        duration = _parse_time(duration)
+        timestamp = time.time() + duration
 
         if server.id not in self.json:
             self.json[server.id] = {}
@@ -109,6 +113,8 @@ class Punish:
 
         # schedule callback for role removal
         self.schedule_unpunish(duration, user, reason)
+
+        await self.bot.say(msg)
 
     @commands.command(pass_context=True, no_pm=True)
     @checks.mod_or_permissions(manage_messages=True)
