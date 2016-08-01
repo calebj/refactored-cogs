@@ -1,16 +1,35 @@
 import discord
 from discord.ext import commands
 from .utils import checks
-import asyncio
+# import asyncio
+# from __main__ import send_cmd_help
 import logging
-# Data stuffies
-from __main__ import send_cmd_help
 from cogs.utils.dataIO import dataIO
 import os
 import time
-# Tabulate, cause its tabulate
-from tabulate import tabulate
+import re
+
+UserInputError = commands.UserInputError
+
 log = logging.getLogger('red.punish')
+
+TIMESPEC_TRANSLATE = {'s': 1, 'm': 60, 'h': 60 * 60, 'd': 60 * 60 * 24}
+
+
+def _parse_time(time):
+    if any(u in time for u in TIMESPEC_TRANSLATE.keys()):
+        delim = '([0-9.]*[{}])'.format(''.join(TIMESPEC_TRANSLATE.keys()))
+        time = re.split(delim, time)
+        time = sum([_timespec_sec(t) for t in time if t != ''])
+    return int(time)
+
+
+def _timespec_sec(t):
+    timespec = t[-1]
+    if timespec.lower() not in TIMESPEC_TRANSLATE:
+        raise UserInputError('Unknown time unit "%c"' % timespec)
+    timeint = float(t[:-1])
+    return timeint * TIMESPEC_TRANSLATE[timespec]
 
 
 class Punish:
@@ -18,11 +37,11 @@ class Punish:
 
     # --- Format
     # {
-    # Server : {
-    #   UserIDs : {
-    #       Until :
-    #       Muted By :
-    #       NumberOfSandwiches :
+    # serverid : {
+    #   memberid : {
+    #       until : timestamp
+    #       by : memberid
+    #       reason: str
     #       }
     #    }
     # }
@@ -32,133 +51,164 @@ class Punish:
         self.bot = bot
         self.location = 'data/punish/settings.json'
         self.json = dataIO.load_json(self.location)
-        self.min = ['m', 'min', 'mins', 'minutes', 'minute']
-        self.hour = ['h', 'hour', 'hours']
-        self.day = ['d', 'day', 'days']
-
-    def _timestamp(self, t, unit):
-        if unit in self.min:
-            return t * 60 + int(time.time())
-        elif unit in self.hour:
-            return t * 60 * 60 + int(time.time())
-        elif unit in self.day:
-            return t * 60 * 60 * 24 + int(time.time())
-        else:
-            raise Exception('Invalid Unit')
+        self.handles = {}
+        self.role_name = 'Punished'
+        bot.loop.create_task(self.on_load())
 
     @commands.command(pass_context=True, no_pm=True)
     @checks.mod_or_permissions(manage_messages=True)
-    async def punish(self, ctx, user: discord.Member, t: int=1, unit='hour'):
-        """Places a user in timeout for a period of time.
+    async def punish(self, ctx, user: discord.Member, duration: str, *, reason: str=None):
+        """Puts a user into timeout for a specified time period, with an optional reason.
+        Time specification is any combination of number with the units s,m,h,d.
+        Example: !punish @idiot 1.1h10m Enough bitching already!"""
 
-        Valid unit of times are minutes, hours & days.
-        Example usage: !punish @kowlin 3 hours"""
         server = ctx.message.server
+        duration = _parse_time(duration)
+        timestamp = time.time() + duration
+
         # --- CREATING ROLE ---
-        if 'Punished' not in [r.name for r in server.roles]:
-            await self.bot.say('The Punished role doesn\'t exist! Creating it now!')
-            log.debug('Creating Punished role in {}'.format(server.id))
-            try:
-                perms = discord.Permissions.none()
-                await self.bot.create_role(server, name='Punished', permissions=perms)
-                await self.bot.say("Role created! Setting channel permissions!\nPlease ensure that your moderator roles are ABOVE the Punished role!\nPlease wait until the user has been added to the Timeout role!")
-                try:
-                    r = discord.utils.get(server.roles, name='Punished')
-                    perms = discord.PermissionOverwrite()
-                    perms.send_messages = False
-                    for c in server.channels:
-                        if c.type.name == 'text':
-                            await self.bot.edit_channel_permissions(c, r, perms)
-                            await asyncio.sleep(1.5)
-                except discord.Forbidden:
-                    await self.bot.say("A error occured while making channel permissions.\nPlease check your channel permissions for the Punished role!")
-            except discord.Forbidden:
-                await self.bot.say("I cannot create a role. Please assign Manage Roles to me!")
-        role = discord.utils.get(server.roles, name='Punished')
-        # --- DONE CREATING ROLE! ---
-        # --- JSON SERVER LOGIC ---
-        if server.id not in self.json:
-            log.debug('Adding server({}) in Json'.format(server.id))
-            self.json[server.id] = {}
-            dataIO.save_json(self.location, self.json)
-        # --- DONE JSON SERVER LOGIC! ---
-        # --- ASSIGNING TIMESTAMPS AND ROLE ---
-        try:
-            if user.id not in self.json[server.id] and role not in user.roles:
-                # USER NOT IN PUNISH, NO ROLE
-                until = self._timestamp(t, unit)
-                self.json[server.id][user.id] = {'until': until, 'givenby': ctx.message.author.display_name}
-                dataIO.save_json(self.location, self.json)
-                await self.bot.add_roles(user, role)
-                await self.bot.say('``{}`` is now Punished for {} {} by ``{}``.'.format(user.display_name, str(t), unit, ctx.message.author.display_name))
-            elif user.id in self.json[server.id] and role not in user.roles:
-                # USER IN PUNISH, NO ROLE
-                await self.bot.say('The user {} is still punished but doesn\' have the role. Do you want to reapply the role?\n*(Say "yes" in chat to confirm or "no" to remove the punishment)*'.format())
-                answer = await self.bot.wait_for_message(timeout=15, author=ctx.message.author)
-                if answer is None:
-                    await self.bot.say('You didn\'t respond in time. Doing nothing.')
-                elif 'yes' in answer.content.lower():
-                    await self.bot.add_roles(user, role)
-                    await self.bot.say('Role reapplied on {}'.format(user.display_name))
-                else:
-                    await self.bot.remove_roles(user, role)
-                    del self.json[server.id][user.id]
-                    dataIO.save_json(self.location, self.json)
-                    await self.bot.say('Alright, punishment is removed from the user.')
-            elif user.id not in self.json[server.id] and role in user.roles:
-                # USER NOT IN PUNISH, HAS ROLE
-                await self.bot.say('{} already had the punished role. Setting the timer'.format(user.display_name))
-                until = self._timestamp(t, unit)
-                self.json[server.id][user.id] = {'until': until, 'givenby': ctx.message.author.display_name}
-                dataIO.save_json(self.location, self.json)
-                await self.bot.say('``{}`` is now Punished for {} {} by ``{}``.'.format(user.display_name, str(t), unit, ctx.message.author.display_name))
+        server = user.server
+        role = discord.utils.get(user.server.roles, name=self.role_name)
+        if not role:
+            if not any(r.permissions.manage_roles for r in server.me.roles) and\
+                    any(r.permissions.manage_channels for r in server.me.roles):
+                await self.bot.say("The Manage Roles and Manage Channels permissions are required to use this command.")
+                return
             else:
-                # USER IN PUNISH, HAS ROLE
-                await self.bot.say('{} is already punished. Do you want to remove the punishment?\n*(Say "yes" in chat to confirm or "no" to cancel)*'.format(user.display_name))
-                answer = await self.bot.wait_for_message(timeout=15, author=ctx.message.author)
-                if answer is None:
-                    await self.bot.say('You didn\'t respond in time. Doing nothing.')
-                elif 'yes' in answer.content.lower():
-                    await self.bot.remove_roles(user, role)
-                    del self.json[server.id][user.id]
-                    dataIO.save_json(self.location, self.json)
-                    await self.bot.say('Punishment deleted on {}'.format(user.display_name))
+                msg = "The %s role doesn't exist; Creating it now... " % self.role_name
+                msgobj = await self.bot.reply(msg)
+                log.debug('Creating punish role')
+                perms = discord.Permissions.none()
+                role = await self.bot.create_role(server, name=self.role_name, permissions=perms)
+                await self.bot.edit_message(msgobj, msgobj.content + 'configuring channels... ')
+                for c in server.channels:
+                    await self.on_channel_create(c, role)
+                await self.bot.edit_message(msgobj, msgobj.content + 'done.')
+
+        self.json = dataIO.load_json(self.location)
+        if server.id not in self.json:
+            self.json[server.id] = {}
+
+        if user.id in self.json[server.id]:
+            await self.bot.say('User was already punished; resetting their timer...')
+        elif role in user.roles:
+            await self.bot.say('User was punished but had no timer, adding it now...')
+        else:
+            await self.bot.say('Done.')
+
+        if server.id not in self.json:
+            self.json[server.id] = {}
+
+        self.json[server.id][user.id] = {'until': timestamp}
+        self.json[server.id][user.id]['by'] = ctx.message.author.id
+        if reason:
+            self.json[server.id][user.id]['reason'] = reason
+
+        await self.bot.add_roles(user, role)
+        dataIO.save_json(self.location, self.json)
+
+        # schedule callback for role removal
+        self.schedule_unpunish(duration, user, reason)
+
+    @commands.command(pass_context=True, no_pm=True)
+    @checks.mod_or_permissions(manage_messages=True)
+    async def unpunish(self, ctx, user: discord.Member):
+        """Removes punishment from a user"""
+        await self._unpunish(user)
+
+    async def on_load(self):
+        """Called when bot is ready and each time cog is (re)loaded"""
+        await self.bot.wait_until_ready()
+        for server, members in self.json.items():
+            server = discord.utils.get(self.bot.servers, id=server)
+            role = discord.utils.get(server.roles, name=self.role_name)
+            for member, data in members.items():
+                duration = data['until'] - time.time()
+                member = discord.utils.get(server.members, id=member)
+                if duration < 0:
+                    await self.bot.remove_roles(member, role)
+                    self._unpunish_data(member)
                 else:
-                    await self.bot.say('Alright, doing nothing')
-        except:
-            await self.bot.say('Invalid unit')
+                    await self.bot.add_roles(member, role)
+                    self.schedule_unpunish(duration, member)
 
-            # Look for new channels, and slap the role in there face!
-    async def new_channel(self, c):
-        if 'Punished' in [r.name for r in c.server.roles]:
-            if c.type.name == 'text':
-                perms = discord.PermissionOverwrite()
-                perms.send_messages = False
-                r = discord.utils.get(c.server.roles, name='Punished')
-                await self.bot.edit_channel_permissions(c, r, perms)
-                log.debug('Punished role created on channel: {}'.format(c.id))
+    # Functions related to unpunishing
 
-    async def check_time(self):
-        while True:
-            log.debug('Ohai first loop')
-            await asyncio.sleep(120)
-            log.debug('First Timer')
-            for server in self.json:
-                log.debug('Server Json')
-                for user in self.json[server]:
-                    log.debug('User Json')
-                    if self.json[server][user]['until'] < int(time.time()):
-                        log.debug('Deleting user({}) from server({}) punish list'.format(user, server))
-                        try:
-                            obj_server = discord.utils.get(self.bot.servers, id=server)
-                            obj_user = discord.utils.get(obj_server.members, id=user)
-                            obj_role = discord.utils.get(obj_server.roles, name='Punished')
-                            del self.json[server][user]
-                            dataIO.save_json(self.location, self.json)
-                            await self.bot.remove_roles(obj_user, obj_role)
-                            log.debug('Done')
-                        except:
-                            pass
+    def schedule_unpunish(self, delay, member, reason=None):
+        """Schedules role removal, canceling and removing existing tasks if present"""
+        handle = self.bot.loop.call_later(delay, self._unpunish_cb, member, reason)
+        sid = member.server.id
+        if sid not in self.handles:
+            self.handles[sid] = {}
+        if member.id in self.handles[sid]:
+            self.handles[sid][member.id].cancel()
+        self.handles[sid][member.id] = handle
+
+    def _unpunish_cb(self, member, reason):
+        """Regular function to be used as unpunish callback"""
+        def wrap(member, reason):
+            return self._unpunish(member, reason)
+        self.bot.loop.create_task(wrap(member, reason))
+
+    async def _unpunish(self, member, reason):
+        """Remove punish role, delete record and task handle"""
+        role = discord.utils.get(member.server.roles, name=self.role_name)
+        if role:
+            await self.bot.remove_roles(member, role)
+            msg = "Your punishiment in %s has ended." % member.server.name
+            if reason:
+                msg += "\nReason was: %s" % reason
+            await self.bot.send_message(member, msg)
+        self._unpunish_data(member)
+
+    def _unpunish_data(self, member):
+        """Removes punish data entry and cancels any present callback"""
+        self.json = dataIO.load_json(self.location)
+        sid = member.server.id
+        if sid in self.json and member.id in self.json[sid]:
+            del(self.json[member.server.id][member.id])
+            dataIO.save_json(self.location, self.json)
+
+        if sid in self.handles and member.id in self.handles[sid]:
+            self.handles[sid][member.id].cancel()
+            del(self.handles[member.server.id][member.id])
+
+    # Listeners
+
+    async def on_channel_create(self, c, role=None):
+        """Run when new channels are created and set up role permissions"""
+        perms = discord.PermissionOverwrite()
+        if c.type == discord.ChannelType.text:
+            perms.send_messages = False
+            perms.send_tts_messages = False
+        elif c.type == discord.ChannelType.voice:
+            perms.speak = False
+        if not role:
+            role = discord.utils.get(c.server.roles, name=self.role_name)
+        await self.bot.edit_channel_permissions(c, role, perms)
+
+    async def on_member_update(self, before, after):
+        """Remove scheduled unpunish when manually removed"""
+        role = discord.utils.get(before.server.roles, name=self.role_name)
+        if role and role in before.roles and role not in after.roles:
+            self._unpunish_data(after)
+
+    async def on_member_join(self, member):
+        """Restore punishment if user leaves/rejoins"""
+        sid = member.server.id
+        role = discord.utils.get(member.server.roles, name=self.role_name)
+        if role:
+            self.json = dataIO.load_json(self.location)
+            if sid not in self.json:
+                return
+            duration = self.json[sid][member.id]['until'] - time.time()
+            if duration > 0:
+                await self.bot.add_roles(member, role)
+                reason = 'punishment re-added on rejoin. '
+                if 'reason' in self.json[sid][member.id]:
+                    reason += self.json[sid][member.id]['reason']
+                if member.id not in self.handles[sid]:
+                    self.schedule_unpunish(duration, member, reason)
 
 
 def check_folder():
@@ -178,6 +228,4 @@ def setup(bot):
     check_folder()
     check_file()
     n = Punish(bot)
-    bot.add_listener(n.check_time, 'on_ready')
-    bot.add_listener(n.new_channel, 'on_channel_create')
     bot.add_cog(n)
